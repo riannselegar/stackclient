@@ -1,0 +1,9 @@
+[project]
+name = "stackclient"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "urllib3>=2.5.0",
+]
