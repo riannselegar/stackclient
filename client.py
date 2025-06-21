@@ -28,16 +28,15 @@ class StackSpotAgentClient:
         if not self.client_id or not self.client_secret or not self.realm:
             self.logger.error("The following credentials must be provided: client_id, client_secret, realm")
             raise MissingCredentialsError("Missing StackSpot client credentials.")
-        if not self.agent_id:
-            self.logger.error("Agent ID must be provided.")
-            raise MissingAgentIDError("Missing StackSpot agent_id.")
-
+        
         self.http = urllib3.PoolManager()
         self.token = self._authenticate()
 
     def _authenticate(self):
         self.logger.info("Authenticating with StackSpot...")
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
         data = {
             "client_id": self.client_id,
             "client_secret": self.client_secret,
@@ -53,12 +52,16 @@ class StackSpotAgentClient:
         self.logger.info("Authentication successful.")
         return token
 
-    def call_agent(self, prompt:str):
-        url = self.AGENT_API_URL.format(agent_id=self.agent_id)
+    def call_agent(self, prompt:str, agent_id:str=None):
+        agent = agent_id or self.agent_id
+        if not agent:
+            self.logger.error("Agent ID must be provided.")
+            raise MissingAgentIDError("Missing StackSpot agent_id.")
+
+        url = self.AGENT_API_URL.format(agent_id=agent)
         headers = {
             "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0"
+            "Content-Type": "application/json"
         }
         payload = {
             "streaming": False,
