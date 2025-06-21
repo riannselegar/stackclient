@@ -2,14 +2,14 @@ import os
 import json
 import logging
 import urllib3
-from exceptions import (
+from .exceptions import (
     AuthenticationError,
     AgentCallError,
     MissingCredentialsError,
     MissingAgentIDError,
 )
 
-class StackSpotAgentClient:
+class StackSpotClient:
     AUTH_URL = "https://idm.stackspot.com/{realm}/oidc/oauth/token"
     AGENT_API_URL = "https://genai-inference-app.stackspot.com/v1/agent/{agent_id}/chat"
 
