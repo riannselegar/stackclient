@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 from typing import Optional, Dict, Any
 import urllib3
 from .exceptions import (
@@ -54,14 +55,28 @@ class StackSpotAgentClient:
             raise MissingCredentialsError("Missing StackSpot client credentials.")
 
         self.http = urllib3.PoolManager()
-        self.token = self._authenticate()
+        self._token_data = self._authenticate()
 
-    def _authenticate(self) -> str:
+    @property
+    def token(self) -> str:
+        """
+        Returns a valid access token, refreshing or reauthenticating if necessary.
+
+        Returns:
+            Access token as a string.
+        """
+        # 30s leeway to avoid edge expiry
+        if time.time() > self._token_data["expires_at"] - 30:
+            self.logger.info("Access token expired or about to expire, refreshing...")
+            self._refresh_token()
+        return self._token_data["access_token"]
+
+    def _authenticate(self) -> Dict[str, Any]:
         """
         Authenticate with StackSpot and obtain an access token.
 
         Returns:
-            Access token as a string.
+            Dict with access_token, refresh_token, and expires_at.
 
         Raises:
             AuthenticationError: If authentication fails.
@@ -79,9 +94,47 @@ class StackSpotAgentClient:
         if resp.status != 200:
             self.logger.error(f"Authentication failed: {resp.status} {resp.data.decode('utf-8')}")
             raise AuthenticationError("Authentication failed.")
-        token = json.loads(resp.data.decode("utf-8"))["access_token"]
+        token_data = json.loads(resp.data.decode("utf-8"))
+        expires_in = token_data.get("expires_in", 3600)
         self.logger.info("Authentication successful.")
-        return token
+        return {
+            "access_token": token_data["access_token"],
+            "refresh_token": token_data.get("refresh_token"),
+            "expires_at": time.time() + expires_in,
+        }
+
+    def _refresh_token(self):
+        """
+        Refresh the access token using the refresh token if available,
+        otherwise re-authenticate using client credentials.
+        """
+        refresh_token = self._token_data.get("refresh_token")
+        if refresh_token:
+            self.logger.info("Refreshing access token using refresh_token...")
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            data = {
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            }
+            resp = self.http.request_encode_body(
+                "POST", self.AUTH_URL.format(realm=self.realm), fields=data, headers=headers, encode_multipart=False
+            )
+            if resp.status == 200:
+                token_data = json.loads(resp.data.decode("utf-8"))
+                expires_in = token_data.get("expires_in", 3600)
+                self._token_data = {
+                    "access_token": token_data["access_token"],
+                    "refresh_token": token_data.get("refresh_token", refresh_token),
+                    "expires_at": time.time() + expires_in,
+                }
+                self.logger.info("Token refreshed successfully.")
+                return
+            else:
+                self.logger.warning("Refresh token failed, falling back to client credentials.")
+        # Fallback: full re-auth
+        self._token_data = self._authenticate()
 
     def call_agent(self, prompt: str, agent_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -119,6 +172,14 @@ class StackSpotAgentClient:
             "POST", url, json=payload, headers=headers
         )
         self.logger.info(f"Response status: {resp.status}")
+        if resp.status == 401:
+            # Token might have expired, force re-auth and retry once
+            self.logger.warning("401 Unauthorized, re-authenticating and retrying once...")
+            self._refresh_token()
+            headers["Authorization"] = f"Bearer {self.token}"
+            resp = self.http.request(
+                "POST", url, json=payload, headers=headers
+            )
         if resp.status != 200:
             self.logger.error(f"Agent call failed: {resp.status} {resp.data.decode('utf-8')}")
             raise AgentCallError("Agent call failed.")
