@@ -25,6 +25,7 @@ class StackSpotAgentClient:
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
         agent_id: Optional[str] = None,
+        log_level: Optional[str] = "DEBUG"
     ):
         """
         Initialize the StackSpotAgentClient.
@@ -34,16 +35,19 @@ class StackSpotAgentClient:
             client_id: OAuth client ID (or from STACKSPOT_CLIENT_ID env var).
             client_secret: OAuth client secret (or from STACKSPOT_CLIENT_SECRET env var).
             agent_id: Default agent ID (or from STACKSPOT_AGENT_ID env var).
+            log_level: Log messages level to display. Can be one of: "INFO", "DEBUG", "WARNING", "ERROR" or "CRITICAL"
 
         Raises:
             MissingCredentialsError: If any required credential is missing.
         """
         self.logger = logging.getLogger("StackSpotAgentClient")
+        
         if not self.logger.hasHandlers():
             handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+            handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d %(levelname)s %(message)s', '%Y-%m-%d %H:%M:%S'))
             self.logger.addHandler(handler)
-        self.logger.setLevel(logging.INFO)
+            
+        self.logger.setLevel(logging.getLevelName(log_level))
 
         self.client_id = client_id or os.getenv("STACKSPOT_CLIENT_ID")
         self.client_secret = client_secret or os.getenv("STACKSPOT_CLIENT_SECRET")
@@ -71,71 +75,77 @@ class StackSpotAgentClient:
             self._refresh_token()
         return self._token_data["access_token"]
 
-    def _authenticate(self) -> Dict[str, Any]:
+    def _request_token(self, data: Dict[str, str]) -> Dict[str, Any]:
         """
-        Authenticate with StackSpot and obtain an access token.
-
-        Returns:
-            Dict with access_token, refresh_token, and expires_at.
-
-        Raises:
-            AuthenticationError: If authentication fails.
+        Request a token from the authentication endpoint with the given data.
+        Returns a dict with access_token, refresh_token, and expires_at.
+        Raises AuthenticationError if the request fails.
         """
-        self.logger.info("Authenticating with StackSpot...")
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        data = {
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "grant_type": "client_credentials",
-        }
         resp = self.http.request_encode_body(
-            "POST", self.AUTH_URL.format(realm=self.realm), fields=data, headers=headers, encode_multipart=False
+            "POST",
+            self.AUTH_URL.format(realm=self.realm),
+            fields=data,
+            headers=headers,
+            encode_multipart=False
         )
         if resp.status != 200:
-            self.logger.error(f"Authentication failed: {resp.status} {resp.data.decode('utf-8')}")
-            raise AuthenticationError("Authentication failed.")
+            self.logger.error(f"Token request failed: {resp.status} {resp.data.decode('utf-8')}")
+            raise AuthenticationError("Token request failed.")
         token_data = json.loads(resp.data.decode("utf-8"))
         expires_in = token_data.get("expires_in", 3600)
-        self.logger.info("Authentication successful.")
         return {
             "access_token": token_data["access_token"],
             "refresh_token": token_data.get("refresh_token"),
             "expires_at": time.time() + expires_in,
         }
 
-    def _refresh_token(self):
-        """
-        Refresh the access token using the refresh token if available,
-        otherwise re-authenticate using client credentials.
-        """
+    def _authenticate(self) -> Dict[str, Any]:
+        """Authenticate with StackSpot and obtain an access token."""
+        self.logger.debug("Authenticating with StackSpot...")
+        data = {
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "grant_type": "client_credentials",
+        }
+        token_data = self._request_token(data)
+        self.logger.debug("Authentication successful.")
+        return token_data
+
+    def _refresh_token(self) -> None:
+        """Refresh the access token using the refresh token if available, otherwise re-authenticate."""
         refresh_token = self._token_data.get("refresh_token")
         if refresh_token:
-            self.logger.info("Refreshing access token using refresh_token...")
-            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            self.logger.debug("Refreshing access token using refresh_token...")
             data = {
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
             }
-            resp = self.http.request_encode_body(
-                "POST", self.AUTH_URL.format(realm=self.realm), fields=data, headers=headers, encode_multipart=False
-            )
-            if resp.status == 200:
-                token_data = json.loads(resp.data.decode("utf-8"))
-                expires_in = token_data.get("expires_in", 3600)
-                self._token_data = {
-                    "access_token": token_data["access_token"],
-                    "refresh_token": token_data.get("refresh_token", refresh_token),
-                    "expires_at": time.time() + expires_in,
-                }
-                self.logger.info("Token refreshed successfully.")
+            try:
+                self._token_data = self._request_token(data)
+                self.logger.debug("Token refreshed successfully.")
                 return
-            else:
+            except AuthenticationError:
                 self.logger.warning("Refresh token failed, falling back to client credentials.")
         # Fallback: full re-auth
         self._token_data = self._authenticate()
-
+        
+    def _make_request(self, token: str, prompt: str, url: str)->urllib3.HTTPResponse:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "streaming": False,
+            "user_prompt": prompt,
+            "stackspot_knowledge": False,
+            "return_ks_in_response": True
+        }
+        
+        return self.http.request(
+            "POST", url, json=payload, headers=headers
+        )
+    
     def call_agent(self, prompt: str, agent_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Send a prompt to the specified StackSpot agent and return the response.
@@ -157,30 +167,22 @@ class StackSpotAgentClient:
             raise MissingAgentIDError("Missing StackSpot agent_id.")
 
         url = self.AGENT_API_URL.format(agent_id=agent)
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "streaming": False,
-            "user_prompt": prompt,
-            "stackspot_knowledge": False,
-            "return_ks_in_response": True
-        }
-        self.logger.info(f"Calling agent endpoint: {url}")
-        resp = self.http.request(
-            "POST", url, json=payload, headers=headers
-        )
-        self.logger.info(f"Response status: {resp.status}")
+
+        self.logger.debug(f"Calling agent endpoint: {url}")
+        resp = self._make_request(self.token, prompt, url)
+        self.logger.debug(f"Response status: {resp.status}")
+
         if resp.status == 401:
             # Token might have expired, force re-auth and retry once
             self.logger.warning("401 Unauthorized, re-authenticating and retrying once...")
             self._refresh_token()
-            headers["Authorization"] = f"Bearer {self.token}"
-            resp = self.http.request(
-                "POST", url, json=payload, headers=headers
-            )
+            resp = self._make_request(self.token, prompt, url)
+            
         if resp.status != 200:
             self.logger.error(f"Agent call failed: {resp.status} {resp.data.decode('utf-8')}")
             raise AgentCallError("Agent call failed.")
-        return json.loads(resp.data.decode("utf-8"))
+        try:
+            return json.loads(resp.data.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to decode agent response: {e}")
+            raise AgentCallError("Invalid JSON response from agent.")

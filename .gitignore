@@ -3,3 +3,4 @@
 .python-version
 **stackclient.egg-info**
 .test.py
+.env
